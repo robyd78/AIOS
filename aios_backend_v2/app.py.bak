@@ -1,0 +1,1046 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shutil
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from pydantic import BaseModel
+
+from . import flag
+
+INTENT_V2_ENABLED = flag("AIOS_INTENT_V2")
+RESOLVER_V2_ENABLED = flag("AIOS_RESOLVER_V2")
+PKG_TOOLS_ENABLED = flag("AIOS_PKG_TOOLS")
+PKG_MUTATIONS_ENABLED = flag("AIOS_PKG_MUTATIONS_V1")
+SYSTEM_CARD_ENABLED = flag("AIOS_SYSTEM_CARD_V1")
+MEMORY_DB_ENABLED = flag("AIOS_MEMORY_DB_V1")
+APP_INDEX_ENABLED = flag("AIOS_APP_INDEX_V1")
+PERSONA_V1_ENABLED = flag("AIOS_PERSONA_V1")
+MEMORY_LTM_ENABLED = flag("AIOS_MEMORY_LTM_V1")
+CONTEXT_V2_ENABLED = flag("AIOS_CONTEXT_V2")
+EMBED_MODEL = os.getenv("AIOS_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+LTM_STORE = os.path.expanduser(os.getenv("AIOS_LTM_STORE", "~/.local/share/aios/ltm"))
+LTM_MAX = int(os.getenv("AIOS_LTM_MAX", "5000") or "5000")
+LTM_K = int(os.getenv("AIOS_LTM_K", "5") or "5")
+LTM_BYTES_CAP = int(os.getenv("AIOS_LTM_BYTES_CAP", "800") or "800")
+_SECRET_PATTERN = re.compile(r"(api[_-]?key\\s*=\\s*[\\w-]+|sk-[a-z0-9]{20,}|bearer\\s+[a-z0-9._-]+)", re.IGNORECASE)
+LOGGER = logging.getLogger(__name__)
+
+from .errors import ServiceUnavailableError
+from .llm import generate
+from .llm_router import select_model
+from .prompt import SYSTEM_PERSONA, tool_catalog
+from .tool_gate import analyze_request
+from .tts import piper_say
+from .tools import registry
+from .tools.registry import list_tools
+from .runtime import cache as runtime_cache
+from . import permissions, logs
+from .context import RequestContext as PromptRequestContext, build_prompt
+from .intent_constraints import (
+    extract_number_hints,
+    hints_active,
+    merge_hints,
+    verify_number_reply,
+)
+
+if INTENT_V2_ENABLED:
+    from .lex.intent_grammar import parse_intent
+    from .lex.intent_actions import infer_tool_call
+else:
+    def parse_intent(text: str) -> dict:  # type: ignore
+        return {}
+
+    def infer_tool_call(intent: dict, pkg_tools_enabled: bool = False):  # type: ignore
+        return None, 0.0
+
+if MEMORY_DB_ENABLED:
+    from .memory import store as memory_store
+
+    memory_store.init_memory()
+else:
+    memory_store = None
+
+if APP_INDEX_ENABLED and MEMORY_DB_ENABLED:
+    from .indexer import apps as app_indexer
+else:
+    app_indexer = None
+
+if SYSTEM_CARD_ENABLED:
+    from .system_card.card import get_system_card, invalidate_cache as invalidate_system_card_cache
+else:
+    def get_system_card():  # type: ignore
+        return {}
+
+    def invalidate_system_card_cache():  # type: ignore
+        return None
+
+if MEMORY_DB_ENABLED or SYSTEM_CARD_ENABLED:
+    from .persona.core import get_persona_card, invalidate_persona_card
+else:
+    def get_persona_card(system_card: Dict[str, Any], memory_store=None):  # type: ignore
+        return {}
+
+    def invalidate_persona_card():  # type: ignore
+        return None
+
+if PERSONA_V1_ENABLED:
+    from .persona.phrases import tone_remark
+else:
+    def tone_remark(*args, **kwargs):  # type: ignore
+        return ""
+
+if MEMORY_LTM_ENABLED:
+    from .memory import ltm as ltm_store
+    from .memory import short_term
+else:
+    ltm_store = None
+    short_term = None
+
+
+def maybe_refresh_system(reason: str, force: bool = False) -> bool:
+    refreshed = False
+    if APP_INDEX_ENABLED and MEMORY_DB_ENABLED and app_indexer:
+        try:
+            refreshed = app_indexer.refresh(force=force) or refreshed
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception(
+                "app_index_refresh_failed",
+                extra={"reason": reason, "force": force},
+                exc_info=exc,
+            )
+    if SYSTEM_CARD_ENABLED:
+        try:
+            invalidate_system_card_cache()
+            refreshed = True
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("system_card_invalidate_failed", extra={"reason": reason}, exc_info=exc)
+    try:
+        invalidate_persona_card()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("persona_invalidate_failed", extra={"reason": reason}, exc_info=exc)
+    return refreshed
+
+
+REFRESH_TRIGGER_TOOLS = {"pkg_install", "pkg_remove", "pkg_update"}
+NUMBER_CATEGORY_HINTS = {"number_game", "game/number", "guess_number", "number"}
+
+app = FastAPI(title="AIOS Backend v2", version="0.2.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:1420",
+        "http://127.0.0.1:1420",
+        "tauri://localhost",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: Optional[str] = None
+
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMessage]
+
+
+class ChatResponse(BaseModel):
+    text: Optional[str] = None
+    model: Optional[str] = None
+    tool_call: Optional[Dict[str, Any]] = None
+    tool_result: Optional[Dict[str, Any]] = None
+    note: Optional[str] = None
+    clarify: Optional[Dict[str, Any]] = None
+    remark: Optional[str] = None
+
+
+class ToolExecuteRequest(BaseModel):
+    name: str
+    arguments: Optional[Dict[str, Any]] = None
+    override_permissions: Optional[List[str]] = None
+
+
+class ToolExecuteResponse(BaseModel):
+    result: Dict[str, Any]
+
+
+class PermissionUpdate(BaseModel):
+    permission: str
+    allow: bool
+
+
+class TTSRequest(BaseModel):
+    text: str
+
+
+DEFAULT_KIND_MAP = {
+    "notes": "notes_app",
+    "office": "office_app",
+    "browser": "browser_app",
+    "terminal": "terminal_app",
+}
+
+
+def normalize_default_kind(kind: Optional[str]) -> Optional[str]:
+    if not kind:
+        return None
+    clean = kind.strip().lower()
+    return DEFAULT_KIND_MAP.get(clean, clean)
+
+
+class RememberAliasRequest(BaseModel):
+    phrase: Optional[str] = None
+    target: Optional[str] = None
+    choice: Optional[str] = None
+    category: Optional[str] = None
+    make_default: Optional[bool] = False
+    confidence: Optional[float] = 0.9
+    status: Optional[str] = "provisional"
+    success_count: Optional[int] = None
+    force: bool = False
+
+
+class AliasSuccessRequest(BaseModel):
+    phrase: str
+
+
+class SetDefaultRequest(BaseModel):
+    kind: str
+    target: str
+
+
+class UserProfileEntry(BaseModel):
+    key: str
+    value: str
+
+
+AIOS_POLICY_TEXT = (
+    "\nAIOS POLICY:\n"
+    "- Trust SYSTEM_CARD, APP_INDEX, ALIASES, and DEFAULTS over general knowledge.\n"
+    "- If an action verb is present and the target app/package is recognized with high confidence, respond with ONE tool_call. Do not provide manual instructions instead.\n"
+    "- Confidence 0.60–0.84: ask one clarifying question (backend may provide options). After user selection, proceed with a single tool_call.\n"
+    "- Confidence <0.60: provide an informational reply. Do not call tools.\n"
+    "- Package channels preference: apt (deb) > snap > flatpak > appimage. Respect explicit user overrides (\"via flatpak\") after a short warning.\n"
+    "- TUIs (htop, btop, vim, etc.) must use open_terminal; never stream TUI output.\n"
+    "- Never install or logout without explicit confirmation. One tool per user message.\n"
+    "Examples:\n"
+    "User: open firefox fullscreen\n"
+    'Assistant: {"tool_call":{"name":"open_app","arguments":{"app":"firefox","fullscreen":true}}}\n'
+    "User: run htop\n"
+    'Assistant: {"tool_call":{"name":"open_terminal","arguments":{"program":"htop"}}}\n'
+    "User: install steam\n"
+    'Assistant: {"tool_call":{"name":"pkg_install","arguments":{"name":"steam"}}}\n'
+)
+
+
+def format_tool_result(name: str, result: Dict[str, Any]) -> str:
+    if name == "get_datetime":
+        if isinstance(result.get("human"), str):
+            return f"It is {result['human']}."
+        if isinstance(result.get("iso"), str):
+            return f"It is {result['iso']}."
+    if name == "open_app":
+        target = result.get("app") or "the application"
+        if result.get("ok"):
+            return f"Launching {target}."
+        return f"Could not launch {target}."
+    if name == "mkdir":
+        path = result.get("path", "")
+        return result.get("ok") and f"Directory '{path}' is ready." or f"Failed to create '{path}': {result.get('message')}"
+    if name == "touch":
+        path = result.get("path", "")
+        return result.get("ok") and f"File '{path}' updated." or f"Failed to write '{path}': {result.get('message')}"
+    if name in {"run_command_safe", "run_command_risky"}:
+        if result.get("ok"):
+            return f"Command succeeded:\n{result.get('stdout', '').strip() or '(no output)'}"
+        return f"Command failed ({result.get('returncode')}): {result.get('stderr', '').strip()}"
+    if name == "open_terminal":
+        if result.get("ok"):
+            note = result.get("note")
+            if note:
+                return note
+            program = result.get("program") or "the program"
+            terminal = result.get("terminal") or "terminal"
+            workspace = result.get("workspace")
+            workspace_note = f" on workspace {workspace}" if workspace else ""
+            return f"Opening {program} in {terminal}{workspace_note}."
+        return f"Terminal launch failed: {result.get('error', 'unknown error')}"
+    return json.dumps(result, ensure_ascii=False)
+
+
+def build_clarify_payload(parsed_intent: Dict[str, Any], phrase: str) -> tuple[Optional[Dict[str, Any]], float]:
+    if not memory_store:
+        return None, 0.0
+    lookup_start = time.perf_counter()
+    category = parsed_intent.get("object", {}).get("category")
+    if not category:
+        return None, 0.0
+    entries = memory_store.search_app_index_by_tag(category, limit=3)
+    lookup_ms = (time.perf_counter() - lookup_start) * 1000
+    if not entries:
+        return None, lookup_ms
+    options = []
+    for entry in entries:
+        options.append(
+            {
+                "id": entry.get("id"),
+                "name": entry.get("name") or entry.get("generic") or entry.get("id"),
+                "source": entry.get("source"),
+            }
+        )
+    return {"kind": "app", "phrase": phrase, "options": options, "category": category}, lookup_ms
+
+
+@app.get("/tools")
+async def tools_catalog():
+    return list_tools()
+
+
+@app.get("/tools/permissions")
+async def get_permissions():
+    return permissions.list_permissions()
+
+
+@app.post("/tools/permissions")
+async def update_permission(body: PermissionUpdate):
+    return permissions.set_permission(body.permission, body.allow)
+
+
+@app.post("/memory/alias")
+async def remember_alias_route(body: RememberAliasRequest):
+    if not memory_store:
+        raise HTTPException(status_code=400, detail="memory disabled")
+    phrase = (body.phrase or "").strip().lower()
+    if not phrase:
+        raise HTTPException(status_code=400, detail="phrase required")
+    target = body.target or body.choice
+    if not target:
+        raise HTTPException(status_code=400, detail="target required")
+    existing = memory_store.get_alias(phrase)
+    if existing and existing.get("target") != target and not body.force:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "alias_exists", "existing": existing},
+        )
+    if existing:
+        status = (body.status or existing.get("status") or "provisional").lower()
+    else:
+        status = (body.status or "provisional").lower()
+    if status not in {"provisional", "confirmed"}:
+        raise HTTPException(status_code=400, detail="invalid alias status")
+    success_count = body.success_count
+    if success_count is None:
+        if existing:
+            success_count = existing.get("success_count") or 0
+        else:
+            success_count = 1 if status == "confirmed" else 0
+    confidence = body.confidence if body.confidence is not None else (existing.get("confidence") if existing else 0.9)
+    memory_store.set_alias(phrase, target, confidence, status=status, success_count=success_count)
+    runtime_cache.set_last_alias_hit(phrase, target)
+    if body.make_default:
+        default_kind = normalize_default_kind(body.category)
+        if default_kind:
+            memory_store.set_default(default_kind, target)
+    return {
+        "ok": True,
+        "status": status,
+        "success_count": success_count,
+        "promoted": status == "confirmed" or success_count >= 2,
+        "target": target,
+    }
+
+
+@app.post("/memory/alias/success")
+async def alias_success_route(body: AliasSuccessRequest):
+    if not memory_store:
+        raise HTTPException(status_code=400, detail="memory disabled")
+    phrase = body.phrase.strip().lower()
+    if not phrase:
+        raise HTTPException(status_code=400, detail="phrase required")
+    updated = memory_store.increment_alias_success(phrase)
+    if not updated:
+        raise HTTPException(status_code=404, detail="alias not found")
+    if updated.get("status") == "confirmed" and (updated.get("success_count") or 0) >= 2:
+        runtime_cache.flag_alias_promoted(updated.get("target"))
+    return {"ok": True, **updated}
+
+
+@app.post("/memory/default")
+async def set_default_route(body: SetDefaultRequest):
+    if not memory_store:
+        raise HTTPException(status_code=400, detail="memory disabled")
+    kind = normalize_default_kind(body.kind)
+    if not kind:
+        raise HTTPException(status_code=400, detail="invalid default kind")
+    memory_store.set_default(kind, body.target)
+    return {"ok": True}
+
+
+@app.get("/memory/user_profile")
+@app.get("/memory/user_profile.get")
+async def get_user_profile_route():
+    if not memory_store:
+        raise HTTPException(status_code=400, detail="memory disabled")
+    return {"ok": True, "profile": memory_store.get_user_profile()}
+
+
+@app.post("/memory/user_profile")
+@app.post("/memory/user_profile.set")
+async def set_user_profile_route(entry: UserProfileEntry):
+    if not memory_store:
+        raise HTTPException(status_code=400, detail="memory disabled")
+    key = entry.key.strip().lower()
+    if not key:
+        raise HTTPException(status_code=400, detail="key required")
+    memory_store.set_user_profile_entry(key, entry.value)
+    return {"ok": True}
+
+
+@app.get("/debug/intent")
+async def debug_intent_endpoint(text: str):
+    if not INTENT_V2_ENABLED:
+        raise HTTPException(status_code=404, detail="intent parser disabled")
+    return {"intent": parse_intent(text)}
+
+
+@app.post("/tools/execute", response_model=ToolExecuteResponse)
+async def run_tool(body: ToolExecuteRequest):
+    tools = registry.load_tools()
+    tool = tools.get(body.name)
+    if not tool:
+        raise HTTPException(status_code=404, detail="unknown tool")
+
+    missing = [perm for perm in tool.permissions if not permissions.is_allowed(perm)]
+    allowed_once = set(body.override_permissions or [])
+    unresolved = [perm for perm in missing if perm not in allowed_once]
+    if unresolved:
+        raise HTTPException(status_code=403, detail={"missing": unresolved})
+
+    args = body.arguments or {}
+    start = time.perf_counter()
+    try:
+        result = await registry.execute(tool.name, args)
+        duration = (time.perf_counter() - start) * 1000
+        logs.log_tool_execution(tool.name, args, ok=True, result=result, duration_ms=duration)
+        return ToolExecuteResponse(result=result)
+    except Exception as exc:  # noqa: BLE001
+        duration = (time.perf_counter() - start) * 1000
+        logs.log_tool_execution(tool.name, args, ok=False, error=str(exc), duration_ms=duration)
+        raise HTTPException(status_code=500, detail=f"tool failed: {exc}") from exc
+
+
+@app.get("/health")
+async def health_check() -> dict:
+    details = {"status": "ok", "ollama": False, "piper": False}
+
+    ollama_base = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=1.0) as client:
+            resp = await client.get(f"{ollama_base}/api/tags")
+            details["ollama"] = resp.status_code == 200
+    except Exception:
+        details["ollama"] = False
+
+    piper_binary = shutil.which("piper")
+    voice_path = os.getenv("PIPER_MODEL") or os.getenv("PIPER_VOICE", "")
+    if piper_binary and voice_path and os.path.exists(voice_path):
+        details["piper"] = True
+
+    if not (details["ollama"] and details["piper"]):
+        details["status"] = "degraded"
+
+    return details
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_route(
+    body: ChatRequest,
+    x_aios_model: str | None = Header(default=None),
+    latency_ms: int | None = Query(default=None),
+) -> ChatResponse:
+    turn_start = time.perf_counter()
+    tools_info = list_tools()
+    available_names = {tool["name"] for tool in tools_info}
+    # Support legacy {"text": "..."} payloads
+    if not getattr(body, "messages", None) and hasattr(body, "text"):
+        latest_user_text = getattr(body, "text", "") or ""
+    else:
+        latest_user_text = ""
+    for msg in reversed(body.messages):
+        if msg.role == "user":
+            latest_user_text = msg.content or ""
+            break
+    if short_term and getattr(body, "messages", None):
+        short_term.seed_from_messages(body.messages)
+    stm_snapshot = short_term.get_summary() if short_term else ""
+    number_hints = merge_hints(
+        extract_number_hints(latest_user_text),
+        extract_number_hints(stm_snapshot),
+    )
+    number_context = (category in NUMBER_CATEGORY_HINTS) or hints_active(number_hints)
+    intent_parse_ms: Optional[float] = None
+    parsed_intent: Dict[str, Any] = {}
+    if INTENT_V2_ENABLED:
+        parse_start = time.perf_counter()
+        parsed_intent = parse_intent(latest_user_text)
+        intent_parse_ms = (time.perf_counter() - parse_start) * 1000
+
+    if INTENT_V2_ENABLED and latest_user_text.strip().lower() == "what would you do?":
+        previous_user = None
+        for msg in reversed(body.messages[:-1]):
+            if msg.role == "user":
+                previous_user = msg.content or ""
+                break
+        if not previous_user:
+            return ChatResponse(text="No previous user prompt to analyze.", model="debug")
+        intent_snapshot = parse_intent(previous_user)
+        return ChatResponse(text=json.dumps(intent_snapshot, ensure_ascii=False), model="intent_debug")
+
+    parsed_snapshot: Dict[str, Any] = {}
+    default_target: Optional[str] = None
+    category = None
+    user_profile_map: Dict[str, str] = {}
+    tone_pref: Optional[str] = None
+    style_pref: Optional[str] = None
+    if INTENT_V2_ENABLED:
+        obj = parsed_intent.get("object") or {}
+        parsed_snapshot = {
+            "verb": parsed_intent.get("verb"),
+            "phrase": (obj.get("raw") or latest_user_text).strip(),
+            "canonical": obj.get("canonical_app"),
+            "confidence": obj.get("confidence"),
+            "category": obj.get("category"),
+            "channel": parsed_intent.get("channel"),
+        }
+        category = obj.get("category")
+        if (
+            memory_store
+            and parsed_intent.get("verb") == "open_app"
+            and category
+            and not obj.get("canonical_app")
+        ):
+            default_key = normalize_default_kind(category)
+            if default_key:
+                default_target = memory_store.get_default(default_key)
+    profile_error: Optional[str] = None
+    if MEMORY_DB_ENABLED and memory_store:
+        try:
+            user_profile_map = memory_store.get_user_profile()
+            tone_pref = (user_profile_map.get("tone") or "").lower()
+            style_pref = (user_profile_map.get("style") or "").lower()
+        except Exception as exc:  # noqa: BLE001
+            profile_error = str(exc)
+    normalized_request = latest_user_text.strip().lower()
+
+    intent_hint = None
+    candidate_conf = 0.0
+    clarify_payload = None
+    index_lookup_ms: Optional[float] = None
+    clarify_option_ids: List[str] = []
+
+    allowed_tool_names: set[str] = set()
+    if INTENT_V2_ENABLED:
+        candidate_call, candidate_conf = infer_tool_call(parsed_intent, PKG_TOOLS_ENABLED)
+        if not candidate_call and default_target and parsed_intent.get("verb") == "open_app":
+            candidate_call = {"name": "open_app", "arguments": {"app": default_target}}
+            candidate_conf = 1.0
+        if candidate_call and candidate_conf >= 0.8:
+            allowed_tool_names = {candidate_call["name"]}
+            intent_hint = candidate_call
+        else:
+            allowed_tool_names = set()
+            intent_hint = candidate_call
+            category = parsed_intent.get("object", {}).get("category")
+            if (
+                not default_target
+                and (candidate_conf >= 0.6 or category)
+                and parsed_intent.get("verb") == "open_app"
+            ):
+                clarify_payload, lookup_ms = build_clarify_payload(parsed_intent, latest_user_text)
+                index_lookup_ms = lookup_ms
+                if clarify_payload:
+                    clarify_option_ids = [opt.get("id") for opt in clarify_payload.get("options", []) if opt.get("id")]
+                    runtime_cache.store_clarify_options(clarify_option_ids)
+    else:
+        allowed_tool_names, intent_hint = analyze_request(latest_user_text, available_names)
+        candidate_conf = intent_hint.get("confidence", 0.0) if intent_hint else 0.0
+
+    if intent_hint and intent_hint.get("name", "").startswith("memory_ltm") and not MEMORY_LTM_ENABLED:
+        allowed_tool_names = set()
+        intent_hint = None
+        candidate_conf = 0.0
+
+    if "show your system prompt" in normalized_request or normalized_request == "show system prompt":
+        allowed_tool_names = {"prompt_dump"}
+        intent_hint = {"name": "prompt_dump", "arguments": {}}
+        candidate_conf = 1.0
+
+    allowed_tools = [tool for tool in tools_info if tool["name"] in allowed_tool_names]
+    schemas_sent = [tool["name"] for tool in allowed_tools]
+    temperature = 0.2 if allowed_tools else (0.6 if PERSONA_V1_ENABLED else 0.7)
+
+    user_choice_id = None
+    if parsed_snapshot.get("canonical") and runtime_cache.consume_clarify_choice(parsed_snapshot.get("canonical")):
+        user_choice_id = parsed_snapshot.get("canonical")
+
+    log_context: Dict[str, Any] = {
+        "user_text": latest_user_text,
+        "model": None,
+        "gate_tools": list(allowed_tool_names),
+        "tools_exposed": list(allowed_tool_names),
+        "schemas_sent": schemas_sent,
+        "temperature_used": temperature,
+        "model_tool_call": False,
+        "synthesized_tool_call": False,
+        "intent_name": intent_hint.get("name") if intent_hint else None,
+        "intent_confidence": candidate_conf,
+        "executed_tool": None,
+        "note": None,
+        "reason": None,
+        "clarify": False,
+        "aliases_hit": False,
+        "default_used": False,
+        "confirmed": False,
+        "alias_promoted": False,
+        "system_card_bytes": 0,
+        "system_refreshed": False,
+        "refresh_reason": None,
+        "intent_parse_ms": intent_parse_ms,
+        "resolver_ms": None,
+        "index_lookup_ms": index_lookup_ms,
+        "clarify_options": clarify_option_ids,
+        "user_choice": None,
+        "default_target": default_target,
+        "flags": {
+            "intent_v2": INTENT_V2_ENABLED,
+            "resolver_v2": RESOLVER_V2_ENABLED,
+            "pkg_tools": PKG_TOOLS_ENABLED,
+            "pkg_mutations": PKG_MUTATIONS_ENABLED,
+            "system_card": SYSTEM_CARD_ENABLED,
+            "memory_db": MEMORY_DB_ENABLED,
+            "app_index": APP_INDEX_ENABLED,
+            "memory_ltm": MEMORY_LTM_ENABLED,
+            "persona_v1": PERSONA_V1_ENABLED,
+        },
+        "parsed": parsed_snapshot,
+        "parsed_intent": parsed_intent if INTENT_V2_ENABLED else {},
+        "channel_override": parsed_intent.get("channel") if INTENT_V2_ENABLED else None,
+        "channel_chosen": None,
+        "response_type": None,
+    }
+    cache_stats = runtime_cache.stats_snapshot()
+    log_context["cache_hits"] = cache_stats.get("hits", 0)
+    log_context["cache_misses"] = cache_stats.get("misses", 0)
+    log_context["persona_v1"] = PERSONA_V1_ENABLED
+    log_context["persona_bytes"] = 0
+    if profile_error:
+        log_context["profile_error"] = profile_error
+    if tone_pref:
+        log_context["profile_tone"] = tone_pref
+    if style_pref:
+        log_context["profile_style"] = style_pref
+    if user_choice_id:
+        log_context["user_choice"] = user_choice_id
+
+    if MEMORY_DB_ENABLED and memory_store:
+        alias_entry = memory_store.get_alias(latest_user_text.strip().lower())
+        if alias_entry:
+            log_context["aliases_hit"] = True
+
+    prompt_bundle = None
+    if CONTEXT_V2_ENABLED:
+        try:
+            prompt_ctx = PromptRequestContext(
+                latest_user_text=latest_user_text,
+                allowed_tools=allowed_tools,
+                tool_catalog=tool_catalog,
+                policy_text=AIOS_POLICY_TEXT,
+                system_persona=SYSTEM_PERSONA,
+                user_profile=user_profile_map,
+                short_term=short_term,
+                memory_store=memory_store if MEMORY_DB_ENABLED else None,
+                system_card_enabled=SYSTEM_CARD_ENABLED,
+                get_system_card=get_system_card,
+                persona_enabled=PERSONA_V1_ENABLED,
+                get_persona_card=get_persona_card,
+                memory_ltm_enabled=MEMORY_LTM_ENABLED,
+                ltm_store=ltm_store,
+                ltm_k=LTM_K,
+                ltm_bytes_cap=LTM_BYTES_CAP,
+                redact_fn=_redact,
+                redact_string_fn=_redact_string,
+            )
+            prompt_bundle = build_prompt(prompt_ctx)
+        except Exception as exc:  # noqa: BLE001
+            log_context["context_error"] = str(exc)
+
+    if prompt_bundle:
+        bundle_metrics = dict(prompt_bundle.metrics)
+        log_context["prompt_metrics"] = dict(bundle_metrics)
+        perf_metrics = bundle_metrics.pop("perf", None)
+        if perf_metrics:
+            log_context.setdefault("perf", {}).update(perf_metrics)
+        log_context.update(bundle_metrics)
+        system_message = prompt_bundle.messages[0]["content"]
+        messages_payload = [dict(msg) for msg in prompt_bundle.messages]
+    else:
+        system_message, legacy_metrics = build_legacy_prompt(
+            latest_user_text=latest_user_text,
+            allowed_tools=allowed_tools,
+            user_profile=user_profile_map,
+            short_term=short_term,
+            memory_store=memory_store if MEMORY_DB_ENABLED else None,
+            system_card_enabled=SYSTEM_CARD_ENABLED,
+            persona_enabled=PERSONA_V1_ENABLED,
+            memory_ltm_enabled=MEMORY_LTM_ENABLED,
+            get_system_card=get_system_card,
+            get_persona_card=get_persona_card,
+            ltm_store=ltm_store,
+        )
+        log_context.update(legacy_metrics)
+        if "prompt_metrics" in legacy_metrics:
+            log_context["prompt_metrics"] = legacy_metrics["prompt_metrics"]
+        messages_payload = [{"role": "system", "content": system_message}]
+    runtime_cache.set_last_system_prompt(system_message)
+    messages_payload.extend(msg.model_dump() for msg in body.messages)
+    chosen_model = select_model(
+        messages_payload,
+        latency_budget_ms=latency_ms,
+        force=x_aios_model,
+    )
+
+    log_context["model"] = chosen_model
+
+    logged = False
+
+    if clarify_payload:
+        log_context["clarify"] = True
+        log_context["clarify_options"] = clarify_option_ids
+        options = clarify_payload.get("options", [])
+        emit_log("clarify", options=options)
+        option_lines = "\n".join(
+            f"- {opt.get('name')} ({opt.get('source')})" for opt in options
+        )
+        text = (
+            f"I found multiple matches for '{clarify_payload.get('phrase')}':\n{option_lines}\n"
+            "Please specify which one."
+        )
+        runtime_cache.push_conversation_turn(latest_user_text, text)
+        if short_term:
+            short_term.push(latest_user_text, text)
+        return ChatResponse(
+            text=text,
+            model="clarify",
+            clarify=clarify_payload,
+        )
+
+    def emit_log(response_type: str, **extra: Any) -> None:
+        nonlocal logged
+        if logged:
+            return
+        payload = dict(log_context)
+        payload["response_type"] = response_type
+        payload["latency_ms"] = (time.perf_counter() - turn_start) * 1000
+        stats = runtime_cache.stats_snapshot()
+        payload["cache_hits"] = stats.get("hits", 0)
+        payload["cache_misses"] = stats.get("misses", 0)
+        reasons = []
+        for key in ("intent_parse_ms", "resolver_ms", "index_lookup_ms"):
+            ms_val = payload.get(key)
+            if isinstance(ms_val, (int, float)) and ms_val and ms_val > 150:
+                reasons.append(f"{key}>{int(ms_val)}ms")
+        if reasons:
+            payload["perf_warn"] = True
+            payload["warn_reason"] = "; ".join(reasons)
+        payload.update(extra)
+        logs.log_chat_turn(payload)
+        logged = True
+
+    try:
+        reply = await generate(messages=messages_payload, model=chosen_model, temperature=temperature)
+    except ServiceUnavailableError as err:
+        emit_log("error", error=str(err))
+        raise HTTPException(status_code=503, detail=str(err)) from err
+
+    tool_call: Optional[Dict[str, Any]] = None
+    if reply:
+        try:
+            parsed = json.loads(reply)
+            if isinstance(parsed, dict) and "tool_call" in parsed:
+                tool_call = parsed["tool_call"]
+                log_context["model_tool_call"] = True
+        except json.JSONDecodeError:
+            tool_call = None
+
+    synthesized_note: Optional[str] = None
+    if not tool_call and INTENT_V2_ENABLED and intent_hint and candidate_conf >= 0.8:
+        tool_call = {
+            "name": intent_hint["name"],
+            "arguments": intent_hint.get("arguments") or {},
+        }
+        synthesized_note = "synthesized_from_intent"
+        log_context["synthesized_tool_call"] = True
+
+    if tool_call:
+        tool_name = tool_call.get("name")
+        args = tool_call.get("arguments") or {}
+        tools_map = registry.load_tools()
+        tool = tools_map.get(tool_name) if tool_name else None
+        if not tool:
+            emit_log("tool_missing", error=f"unknown tool {tool_name}")
+            return ChatResponse(text="Tool unavailable right now.", model=chosen_model)
+
+        missing = [perm for perm in tool.permissions if not permissions.is_allowed(perm)]
+        if missing:
+            emit_log("tool_call", missing_perms=missing)
+            return ChatResponse(model=chosen_model, tool_call=tool_call, note=synthesized_note)
+
+        start = time.perf_counter()
+        try:
+            result = await registry.execute(tool.name, args)
+            duration = (time.perf_counter() - start) * 1000
+            logs.log_tool_execution(tool.name, args, ok=True, result=result, duration_ms=duration)
+            message = format_tool_result(tool.name, result)
+            if isinstance(result, dict):
+                log_context["channel_chosen"] = result.get("channel")
+                log_context["reason"] = result.get("note") or result.get("reason")
+                log_context["note"] = result.get("note") or message
+                if result.get("resolver_ms") is not None:
+                    log_context["resolver_ms"] = result.get("resolver_ms")
+                if result.get("alias_promoted"):
+                    log_context["alias_promoted"] = True
+                if (
+                    PERSONA_V1_ENABLED
+                    and tone_pref in {"playful", "dry"}
+                    and result.get("ok")
+                ):
+                    tone_sentence = tone_remark(tone_pref, "tool")
+                    if tone_sentence:
+                        message = f"{message} {tone_sentence}"
+                        log_context["remark"] = tone_sentence
+                if (
+                    log_context.get("default_target")
+                    and tool.name == "open_app"
+                    and result.get("app") == log_context.get("default_target")
+                ):
+                    log_context["default_used"] = True
+            else:
+                log_context["note"] = message
+
+            refreshed = False
+            refresh_reason = None
+            if isinstance(result, dict) and result.get("refreshed"):
+                refreshed = bool(result.get("refreshed"))
+                refresh_reason = tool.name
+            elif tool.name in REFRESH_TRIGGER_TOOLS:
+                if maybe_refresh_system(tool.name):
+                    refreshed = True
+                    refresh_reason = tool.name
+            elif isinstance(result, dict) and result.get("reindexed"):
+                reason = f"{tool.name}:reindexed"
+                if maybe_refresh_system(reason):
+                    refreshed = True
+                    refresh_reason = reason
+
+            if refreshed:
+                log_context["system_refreshed"] = True
+                log_context["refresh_reason"] = refresh_reason
+
+            log_context["executed_tool"] = tool.name
+            log_context["confirmed"] = True
+            runtime_cache.push_conversation_turn(latest_user_text, message)
+            if short_term:
+                short_term.push(latest_user_text, message)
+            emit_log("executed_tool")
+            return ChatResponse(text=message, model=chosen_model, tool_result=result)
+        except Exception as exc:  # noqa: BLE001
+            duration = (time.perf_counter() - start) * 1000
+            logs.log_tool_execution(tool.name, args, ok=False, error=str(exc), duration_ms=duration)
+            log_context["reason"] = str(exc)
+            emit_log("tool_error", error=str(exc))
+            return ChatResponse(text=f"Tool error: {exc}", model=chosen_model)
+
+    remark: Optional[str] = None
+    if isinstance(reply, str):
+        if number_context:
+            corrected_reply = verify_number_reply(reply, number_hints)
+            if corrected_reply != reply:
+                reply = corrected_reply
+                log_context["constraint_fix"] = True
+        log_context["note"] = reply
+        if PERSONA_V1_ENABLED and not log_context.get("clarify"):
+            safe_reply = reply.lower()
+            is_safety = safe_reply.startswith("permission") or safe_reply.startswith("error")
+            if tone_pref in {"playful", "dry"} and not is_safety:
+                remark_candidate = tone_remark(tone_pref, "text")
+                if remark_candidate:
+                    remark = remark_candidate
+                    log_context["remark"] = remark
+        assistant_text = reply if not remark else f"{reply} {remark}"
+        runtime_cache.push_conversation_turn(latest_user_text, assistant_text)
+        if short_term:
+            short_term.push(latest_user_text, assistant_text)
+    emit_log("text_reply")
+    return ChatResponse(text=reply, model=chosen_model, remark=remark)
+
+
+@app.post("/tts")
+async def tts_route(body: TTSRequest) -> Response:
+    try:
+        audio_bytes = await piper_say(body.text)
+    except ServiceUnavailableError as err:
+        raise HTTPException(status_code=503, detail=str(err)) from err
+
+    return Response(content=audio_bytes, media_type="audio/wav")
+
+
+def build_legacy_prompt(
+    *,
+    latest_user_text: str,
+    allowed_tools: List[Dict[str, Any]],
+    user_profile: Dict[str, Any],
+    short_term,
+    memory_store,
+    system_card_enabled: bool,
+    persona_enabled: bool,
+    memory_ltm_enabled: bool,
+    get_system_card,
+    get_persona_card,
+    ltm_store,
+) -> Tuple[str, Dict[str, Any]]:
+    prompt_metrics = {
+        "stm_bytes": 0,
+        "stm_tokens_est": 0,
+        "ltm_count": 0,
+        "ltm_bytes": 0,
+        "system_card_bytes": 0,
+        "persona_bytes": 0,
+        "tools_bytes": 0,
+        "memory_used_flags": {"stm": False, "ltm": False, "sc": False},
+        "clamped": {"stm": False, "ltm": False, "tools": False},
+        "section_order": ["memory", "system_card", "persona", "tools", "policy"],
+    }
+
+    system_card_data: Dict[str, Any] = {}
+    if system_card_enabled:
+        try:
+            system_card_data = get_system_card() or {}
+            blob = f"SYSTEM_CARD: {json.dumps(system_card_data)}\n"
+            prompt_metrics["system_card_bytes"] = len(blob)
+            prompt_metrics["memory_used_flags"]["sc"] = bool(system_card_data)
+        except Exception:
+            system_card_data = {}
+
+    short_summary = short_term.get_summary() if short_term else ""
+    short_summary = _redact_string(short_summary[:200]) if short_summary else ""
+    prompt_metrics["stm_bytes"] = len(short_summary.encode("utf-8"))
+    prompt_metrics["stm_tokens_est"] = prompt_metrics["stm_bytes"] // 4 if short_summary else 0
+    prompt_metrics["memory_used_flags"]["stm"] = bool(short_summary)
+
+    long_term_hits: List[str] = []
+    if memory_ltm_enabled and ltm_store:
+        seed = f"{latest_user_text} || {short_summary}".strip()[:400]
+        try:
+            memories, _ = ltm_store.search(seed, LTM_K, return_perf=False)
+            for mem in memories:
+                snippet = (mem.get("summary") or mem.get("text", "") or "").replace("\n", " ").strip()
+                if snippet:
+                    long_term_hits.append(_redact(snippet)[:200])
+        except Exception:
+            long_term_hits = []
+    prompt_metrics["ltm_count"] = len(long_term_hits)
+    prompt_metrics["memory_used_flags"]["ltm"] = bool(long_term_hits)
+    prompt_metrics["ltm_bytes"] = len("\n".join(long_term_hits).encode("utf-8"))
+
+    memory_lines = ["MEMORY CONTEXT:"]
+    memory_lines.append(f'- Short-term: "{short_summary or "(none)"}"')
+    if long_term_hits:
+        memory_lines.append("- Long-term hits:")
+        memory_lines.extend(f"  • {hit}" for hit in long_term_hits[:3])
+    else:
+        memory_lines.append("- Long-term hits: (none)")
+    memory_context_blob = "\n".join(memory_lines)
+
+    persona_card_blob = ""
+    if persona_enabled:
+        try:
+            persona_card = get_persona_card(system_card_data, memory_store)
+            if persona_card:
+                persona_bytes = json.dumps(persona_card).encode("utf-8")
+                prompt_metrics["persona_bytes"] = len(persona_bytes)
+                if len(persona_bytes) > 1024:
+                    trimmed = persona_bytes[:1000].decode("utf-8", errors="ignore")
+                    persona_card_blob = f"PERSONALITY CARD: {trimmed}...[truncated]"
+                else:
+                    persona_card_blob = f"PERSONALITY CARD: {persona_bytes.decode('utf-8')}"
+        except Exception:
+            persona_card_blob = ""
+
+    behavior_guidelines = (
+        "BEHAVIORAL GUIDELINES:\n"
+        "- Use light humor when tone=playful, be brief and deadpan when tone=dry, be neutral when tone=serious.\n"
+        "- Prefer clarity over flourish. One tool per turn. Act on high confidence, ask once on medium, explain on low.\n"
+    )
+
+    persona_stub = (
+        'PERSONALITY CARD:\n'
+        '{"identity":"AIOS Assistant","role":"Voice-first desktop orchestrator for Ubuntu",'
+        '"traits":["helpful","dry-humored","direct","concise","empathetic"],'
+        f'"user_profile":{json.dumps(user_profile)},'
+        '"memory_summary":"legacy"}'
+    )
+
+    sections = [
+        "You are the voice interface of a local desktop.",
+        memory_context_blob.strip(),
+        (persona_card_blob or persona_stub).strip(),
+        behavior_guidelines.strip(),
+        SYSTEM_PERSONA.strip(),
+    ]
+
+    if allowed_tools:
+        tool_block = (
+            "Available tools this turn:\n"
+            f"{tool_catalog(allowed_tools)}\n"
+            f"Tool catalog JSON:\n{json.dumps(allowed_tools, indent=2)}\n"
+            "When calling a tool respond exactly with JSON (no prose)."
+        )
+        sections.extend([tool_block, AIOS_POLICY_TEXT.strip()])
+        prompt_metrics["tools_bytes"] = len(tool_block.encode("utf-8"))
+    else:
+        sections.append("No automation tools are available this turn; respond conversationally.")
+
+    system_message = "\n\n".join(section for section in sections if section)
+    legacy_updates = {
+        "prompt_metrics": prompt_metrics,
+        "system_card_bytes": prompt_metrics["system_card_bytes"],
+        "persona_bytes": prompt_metrics["persona_bytes"],
+        "ltm_bytes": prompt_metrics["ltm_bytes"],
+        "ltm_count": prompt_metrics["ltm_count"],
+        "stm_bytes": prompt_metrics["stm_bytes"],
+    }
+    return system_message, legacy_updates
+
+
+
+def _redact(text: str) -> str:
+    return _SECRET_PATTERN.sub("[REDACTED]", str(text))
+
+
+def _redact_string(text: str) -> str:
+    return _SECRET_PATTERN.sub("[REDACTED]", str(text))

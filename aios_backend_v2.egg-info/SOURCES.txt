@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+aios_backend_v2/__init__.py
+aios_backend_v2/app.py
+aios_backend_v2/llm.py
+aios_backend_v2/tts.py
+aios_backend_v2.egg-info/PKG-INFO
+aios_backend_v2.egg-info/SOURCES.txt
+aios_backend_v2.egg-info/dependency_links.txt
+aios_backend_v2.egg-info/requires.txt
+aios_backend_v2.egg-info/top_level.txt

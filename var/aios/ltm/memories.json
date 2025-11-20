@@ -1,0 +1,72 @@
+[
+  {
+    "text": "User lives in Spain but is originally from the UK.",
+    "kind": "fact",
+    "strength": 0.8,
+    "source": "manual_fix",
+    "created_ts": 1763095001.0,
+    "id": "location-rob",
+    "privacy": "personal",
+    "summary": "User lives in Spain but is originally from the UK."
+  },
+  {
+    "text": "User is building an AI-first desktop OS called AIOS.",
+    "kind": "project_fact",
+    "strength": 0.9,
+    "source": "manual_fix",
+    "created_ts": 1763095002.0,
+    "id": "project-aios",
+    "privacy": "personal",
+    "summary": "User is building an AI-first desktop OS called AIOS."
+  },
+  {
+    "text": "User prefers a playful tone.",
+    "kind": "preference",
+    "strength": 0.8,
+    "source": "manual_fix",
+    "created_ts": 1763095003.0,
+    "id": "pref-playful",
+    "privacy": "personal",
+    "summary": "User prefers a playful, honest tone."
+  },
+  {
+    "text": "Remember : My name is Rob and I live in Spain",
+    "kind": "note",
+    "app_tags": [],
+    "ttl_days": null,
+    "id": "6922fd0b-3e47-401d-9667-dd560476cf3a",
+    "created_ts": 1763095853.1089885,
+    "privacy": "personal",
+    "source": "user",
+    "summary": "Remember : My name is Rob and I live in Spain (Remember My Rob I)"
+  },
+  {
+    "text": "{\"name\": \"Rob and I live in Spain\", \"location_current\": \"Spain\"}",
+    "summary": "User profile — Name: Rob and I live in Spain; Location: Spain",
+    "kind": "user_profile",
+    "strength": 0.9,
+    "source": "memory_evaluator",
+    "created_ts": 1763095853.1646152,
+    "id": "profile-rob"
+  },
+  {
+    "text": "User mentioned AIOS context: God dam AIOS I said you could have 3 guesses, not all at the same time though, your supposed to wait untill I tell you if it was correct before you guess again, thats k...",
+    "kind": "project_fact",
+    "strength": 0.6,
+    "source": "memory_evaluator",
+    "created_ts": 1763098073.851061,
+    "id": "310d740e-8be7-4594-b90e-bb096a75264f",
+    "privacy": "personal",
+    "summary": "User mentioned AIOS context: God dam AIOS I said you could have 3 guesses, not all at the same time though, your supposed to wait untill I tell you if it was correct before you guess again, thats k..."
+  },
+  {
+    "text": "User prefers it.",
+    "kind": "preference",
+    "strength": 0.8,
+    "source": "memory_evaluator",
+    "created_ts": 1763462098.1753063,
+    "id": "94611c49-4ac9-4c11-afd2-e5ba3a3e3956",
+    "privacy": "personal",
+    "summary": "User prefers it"
+  }
+]

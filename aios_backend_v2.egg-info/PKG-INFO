@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: aios-backend-v2
+Version: 0.1.0
+Summary: FastAPI backend providing chat and TTS endpoints for AIOS.
+Author: AIOS
+Requires-Python: >=3.11
+Requires-Dist: fastapi
+Requires-Dist: uvicorn[standard]
+Requires-Dist: httpx
+Requires-Dist: pydantic
+Provides-Extra: dev

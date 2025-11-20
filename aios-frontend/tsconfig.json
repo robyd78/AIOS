@@ -1,0 +1,14 @@
+{
+  "extends": "@tsconfig/svelte/tsconfig.json",
+  "compilerOptions": {
+    "moduleResolution": "bundler",
+    "module": "ESNext",
+    "target": "ES2022",
+    "types": ["svelte", "svelte/ambient", "vite/client", "@tauri-apps/api"],
+    "typeRoots": ["./types", "./node_modules/@types"],
+    "strict": true,
+    "allowJs": true,
+    "checkJs": false
+  },
+  "include": ["src/**/*.ts", "src/**/*.svelte", "src/**/*.d.ts", "vite.config.ts"]
+}

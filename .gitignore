@@ -1,0 +1,9 @@
+.venv/
+node_modules/
+aios-frontend/node_modules/
+*.pyc
+__pycache__/
+.DS_Store
+*.log
+/var/aios/logs/prompt_dump/
+.env

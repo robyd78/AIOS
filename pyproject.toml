@@ -1,0 +1,20 @@
+[project]
+name = "aios-backend-v2"
+version = "0.1.0"
+description = "FastAPI backend providing chat and TTS endpoints for AIOS."
+authors = [{ name = "AIOS" }]
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "httpx",
+  "pydantic",
+  "pytz",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
