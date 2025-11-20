@@ -28,11 +28,11 @@ The rest of this doc covers architecture, feature flags, context/memory systems,
 Key backend subsystems:
 
 1. **Context Assembler** (`aios_backend_v2/context/assembler.py`)
-   - Builds a layered prompt with SYSTEM NOTE, 🧠 STM/LTM, 🖥️ System Card, 🎭 Persona, 📏 Behavioral rules, 🛠️ Tool catalog, and AIOS policy.
+   - Builds a layered prompt with SYSTEM NOTE, `=== RECENT CONVERSATION SUMMARY ===` (STM), `=== RELEVANT LONG-TERM FACTS ===`, 🖥️ System Card, 🎭 Persona, 📏 Behavioral rules, 🛠️ Tool catalog, and AIOS policy.
    - Emits `prompt_metrics` (bytes, clamps, section order) into `chat_turns.ndjson`.
 2. **Memory Layers** (`memory/short_term.py`, `memory/ltm.py`)
-   - STM: seeded from every incoming `messages` array; produces goal-oriented summaries.
-- LTM: FAISS-backed store under `var/aios/ltm` (overridable via `AIOS_DATA_DIR`) with IDs, summaries, and policy reminders (“use only when relevant”).
+   - STM: seeded from every incoming `messages` array; produces a natural-language “Topic / User goal / Assistant has / Open” summary used by both `/chat` and `/debug/context`.
+   - LTM: FAISS-backed store under `var/aios/ltm` (overridable via `AIOS_DATA_DIR`) with IDs, summaries, and policy reminders (“use only when relevant”), surfaced as readable bullets.
 3. **Intent Stack** (`lex/intent_grammar.py`, `intent/constraints.py`)
    - Deterministic verbs/actions + constraint verifier for number games.
    - Tool gate exposes only the schemas needed per turn.
@@ -86,6 +86,8 @@ export AIOS_LTM_BYTES_CAP=800
 | `AIOS_PERSONA_V1` | Persona card + tone-based remarks (playful/dry). |
 | `AIOS_MEMORY_LTM_V1` | FAISS-backed LTM store + tools (`memory_ltm_*`). |
 | `AIOS_CONTEXT_V2` | Toggle the structured Context Assembler (falls back to legacy prompt when off). |
+| `AIOS_DEBUG_CONTEXT` | Enable `/debug/context` snapshot endpoint. |
+| `AIOS_DEBUG_PROMPT_DUMP` | Write each assembled prompt to `var/aios/logs/prompt_dump/`. |
 
 All long-term memories stay local under `$AIOS_LTM_STORE`; nothing is synced externally.
 
@@ -125,6 +127,18 @@ Manual backend start (if needed):
 source .venv/bin/activate
 uvicorn aios_backend_v2.app:app --host 127.0.0.1 --port 8000
 ```
+
+---
+
+## Runtime data & debugging
+
+- **Data root**: defaults to `var/aios/` inside the repo. Override via `AIOS_DATA_DIR` if you prefer the legacy `$HOME/.local/share/aios`.
+  - `ltm/` – FAISS memories (`AIOS_LTM_STORE` now points here by default).
+  - `logs/` – `chat_turns.ndjson`, `tools.ndjson`, and optional prompt dumps.
+  - `ws/` – Hyprland workspace tags.
+  - `aios.db` – SQLite preferences/aliases/defaults (`AIOS_DB_PATH`).
+- **Prompt dumps**: set `AIOS_DEBUG_PROMPT_DUMP=true` to mirror every assembled system prompt to `var/aios/logs/prompt_dump/prompt_<timestamp>.txt`.
+- **Context snapshot**: set `AIOS_DEBUG_CONTEXT=true` and call `GET /debug/context` to inspect STM summary/state, relevant LTM facts, recent turns, scene + turn context, and a short system prompt excerpt.
 
 ---
 
@@ -207,7 +221,7 @@ Permissions are stored at `~/.config/aios/permissions.json`. Tool execution logs
 - `resolve_app_debug` (shell:read) reports which command/source `open_app` would use without launching anything—useful for diagnosing missing installs.
 - `system_refresh` refreshes the cached System Card + app index snapshots; it’s read-only, respects feature flags, and is handy after you change package state outside AIOS.
 - `memory_ltm_add/search/forget/prune` (behind `AIOS_MEMORY_LTM_V1`) manage the local FAISS-backed long-term store. Data never leaves `$AIOS_LTM_STORE`; the assistant only calls these when you explicitly ask (“remember that…”, “what do you remember…”, “forget memory <id>”).
-- `prompt_dump` (diagnostic) prints the first 1.5KB of the active system prompt so you can inspect persona/policy text (“show your system prompt”).
+- `prompt_dump` (diagnostic) still works for ad-hoc testing, but the canonical prompt view now comes from the files in `var/aios/logs/prompt_dump/` when `AIOS_DEBUG_PROMPT_DUMP=true`.
 - `user_profile.set` stores persona preferences (e.g., `name`, `tone`, `style`, `pref_terminal`). Phrases like “call me Lucy” or “be serious” synthesize this tool automatically.
 - `logs_status` (no permissions) reports current log sizes and last rotation timestamps so you can verify rotation/perf warnings.
 - With `AIOS_INTENT_V2=on`, the assistant uses a deterministic parser + confidence thresholds. High confidence → single tool_call; medium confidence → it lists the matching local apps (e.g., “OnlyOffice / LibreOffice”) and waits for you to choose; low confidence → text-only explanation.
@@ -215,7 +229,7 @@ Permissions are stored at `~/.config/aios/permissions.json`. Tool execution logs
 - `pkg_install`, `pkg_remove`, `pkg_update` (pkg:* permissions, gated by both `AIOS_PKG_TOOLS` and `AIOS_PKG_MUTATIONS_V1`) operate on a short allowlist (Steam, OnlyOffice, Firefox, VLC). Each run performs a dry-run (when supported), surfaces the exact commands, and executes only after the permission modal is confirmed. Channel preference is apt ▶ snap ▶ flatpak unless you specify e.g. “via flatpak”.
 - When `AIOS_SYSTEM_CARD_V1=on`, each LLM turn receives a compact SYSTEM_CARD (OS + session + pkg managers + defaults/aliases/app snapshots) so the assistant trusts local state over general knowledge.
 - Clarifier/alias loop: `/memory/alias` persists a phrase → app mapping after the user confirms; each alias starts as `provisional` and `/memory/alias/success` bumps its `success_count`, automatically promoting to `confirmed` after two successful launches. The clarifier modal now includes a “make this my default” checkbox per category—when checked, `/memory/default` stores the preference and future “open office / create a note” requests launch the chosen app automatically. Existing aliases aren’t overwritten unless you pass `force=true`, so the UI can ask for explicit confirmation before changing them.
-- Debugging: when `AIOS_INTENT_V2=on`, you can inspect the deterministic parser via `GET /debug/intent?text=...` or by sending “what would you do?” after a user prompt—the assistant replies with the parsed intent JSON. These are read-only diagnostics.
+- Debugging: when `AIOS_INTENT_V2=on`, you can inspect the deterministic parser via `GET /debug/intent?text=...` or by sending “what would you do?” after a user prompt—the assistant replies with the parsed intent JSON. `/debug/context` (behind `AIOS_DEBUG_CONTEXT`) shows the last STM summary, STM state, LTM facts, scene, turn context, and recent turns; enable `AIOS_DEBUG_PROMPT_DUMP` to mirror every prompt verbatim.
 - Hyprland workspaces are tagged under `var/aios/ws/`, reused when empty, and can be cleaned via `close_empty_aios_workspaces`.
 - “Allow once” performs a one-off override; “Always allow” persists to `~/.config/aios/permissions.json`. Permission prompts live in `src/App.svelte` near `permissionPrompt`.
 - A lightweight intent gate (`aios_backend_v2/tool_gate.py`) only exposes likely tools per turn, so chit-chat doesn’t trigger unnecessary tool calls or prompt bloat.
@@ -270,7 +284,7 @@ Each chat turn logs `prompt_metrics` inside `chat_turns.ndjson`, e.g.:
 }
 ```
 
-STM clamps when the summary exceeds ~200 chars, LTM clamps when the YAML section hits `AIOS_LTM_BYTES_CAP`, and the tools block reports how much room the catalog + policy consumed. Use `prompt_dump` to verify the rendered sections (“SYSTEM NOTE”, emoji labels, policies, examples).
+STM clamps when the summary exceeds ~200 chars, LTM clamps when the facts block hits `AIOS_LTM_BYTES_CAP`, and the tools block reports how much room the catalog + policy consumed. Inspect `var/aios/logs/prompt_dump/prompt_<ts>.txt` to verify the rendered sections (“SYSTEM NOTE”, emoji labels, policies, examples).
 
 ### Memory layers at a glance
 
